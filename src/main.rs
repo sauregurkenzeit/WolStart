@@ -1,7 +1,6 @@
 extern crate pnet;
 extern crate sysinfo;
 
-use pnet::packet::Packet;
 use pnet::datalink::{self, NetworkInterface};
 use sysinfo::{System, SystemExt};
 use std::process::Command;
