@@ -1,7 +1,3 @@
-Got it. Here's a revised description for the `WolStart` project, taking into account the necessary configuration and dependencies:
-
----
-
 # WolStart
 
 ## Description
