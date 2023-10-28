@@ -1,86 +1,172 @@
-extern crate pnet;
-extern crate sysinfo;
+mod service;
+use std::{
+    thread::sleep,
+    time::{Duration, Instant},
+    ffi::OsString,
+    env
+};
+use std::fs::File;
+use log::{error, info, LevelFilter};
+use simplelog::*;
+use windows_service::{
+    service::{ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType, ServiceState},
+    service_manager::{ServiceManager, ServiceManagerAccess},
+};
+use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+use clap::Command;
 
-use pnet::datalink::{self, NetworkInterface};
-use sysinfo::{System, SystemExt};
-use std::process::Command;
+const DEFAULT_PROGRAM: &str = "kodi.exe";
+const DEFAULT_RUN_PATH: &str = "C:\\Program Files\\Kodi\\kodi.exe";
+const DEFAULT_HOST_IP: &str = "192.168.1.132";
+const DEFAULT_LOG_LEVEL: &str = "warn";
+fn main() -> windows_service::Result<()> {
+    // Parse args
+    let log_file = File::create("wol_service.log").unwrap();
+    let cmd = Command::new("WakeOnLan Start")
+        .subcommand(
+            Command::new("install")
+                .about("Installs the service")
+                .arg(
+                    clap::arg!(--"program" <PROGRAM>)
+                        .help("Program to use")
+                        .default_value(DEFAULT_PROGRAM),
+                )
+                .arg(
+                    clap::arg!(--"run-path" <RUN_PATH>)
+                        .help("Path to run the program from")
+                        .default_value(DEFAULT_RUN_PATH),
+                )
+                .arg(
+                    clap::arg!(--"host-ip" <HOST_IP>)
+                        .help("IP address of the host")
+                        .default_value(DEFAULT_HOST_IP),
+                )
+                .arg(
+                    clap::arg!(--"log-level" <LOG_LEVEL>)
+                        .help("Logging level")
+                        .default_value(DEFAULT_LOG_LEVEL),
+                ),
+            )
+        .subcommand(Command::new("uninstall").about("Uninstalls the service")
+                        .arg(
+                            clap::arg!(--"log-level" <LOG_LEVEL>)
+                                .help("Logging level")
+                                .default_value(DEFAULT_LOG_LEVEL),
+                        ),
+        )
+        .allow_external_subcommands(true);
 
-const PROGRAM: &str = "kodi.exe";
-const RUN_PATH: &str = "C:\\Program Files\\Kodi\\kodi.exe";
-const HOST_IP: &str = "192.168.1.132";
-
-
-fn main() {
-    let interfaces = datalink::interfaces();
-    let interface = interfaces
-        .into_iter().find(|iface| iface.ips.iter()
-        .any(|ip| ip.to_string().starts_with(HOST_IP)))
-    .expect("Could not find the interface with the target IP address");
-
-    loop {
-        // listen_for_wol(&interface)
-        if !is_kodi_running() {
-            listen_for_wol(&interface);
+    // Initialize logging
+    let matches = cmd.get_matches();
+    // Extract log level early, and set a default if it doesn't exist
+    let log_level = if let Some(matches) = matches.subcommand_matches("install")
+        .or_else(|| matches.subcommand_matches("uninstall")) {
+        match matches.get_one::<String>("log-level").unwrap_or(&String::from("info")).as_str() {
+            "trace" => LevelFilter::Trace,
+            "debug" => LevelFilter::Debug,
+            "warn"=> LevelFilter::Warn,
+            "error" => LevelFilter::Error,
+            _ => LevelFilter::Info,
         }
-        std::thread::sleep(std::time::Duration::from_secs(10));
-    }
-}
-
-fn is_kodi_running() -> bool {
-    let sys = System::new_all();
-    let x = !sys.processes_by_name(PROGRAM).next().is_none();
-    x
-}
-
-fn is_wol_packet(packet: &[u8]) -> bool {
-    // Minimum length for WOL payload
-    if packet.len() < 6 + 16 * 6 {
-        return false;
-    }
-
-    let wol_start = packet.len() - (6 + 16 * 6);
-
-    // Check for 6 bytes of 0xFF
-    if packet[wol_start..wol_start + 6] != [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] {
-        return false;
-    }
-
-    // Get the repeated MAC address from the packet
-    let mac = &packet[wol_start + 6..wol_start + 12];
-
-    // Check for 16 repetitions of the MAC address
-    for i in 0..16 {
-        if packet[wol_start + 6 + i * 6..wol_start + 6 + (i + 1) * 6] != *mac {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn listen_for_wol(interface: &NetworkInterface) {
-    let channel = datalink::channel(interface, Default::default()).unwrap();
-
-    let mut rx = match channel {
-        datalink::Channel::Ethernet(_, rx) => rx,
-        _ => panic!("Failed to create datalink channel"),
+    } else {
+        LevelFilter::Info // Default level if no subcommand or something goes wrong
     };
-
-    loop {
-        match rx.next() {
-            Ok(packet) => {
-                if is_wol_packet(packet) {
-                    println!("Wake-on-LAN packet detected!");
-                    // Stop listening and break the loop.
-                    break;
-                }
-            },
-            Err(e) => {
-                eprintln!("An error occurred while reading packet: {:?}", e);
-                continue;
-            },
+    CombinedLogger::init(
+        vec![
+            TermLogger::new(LevelFilter::Warn, Config::default(), TerminalMode::Mixed, ColorChoice::Auto),
+            WriteLogger::new(log_level, Config::default(), log_file)
+        ]
+    ).unwrap();
+    info!("{:?}", matches.subcommand());
+    match matches.subcommand() {
+        Some(("install", install_matches)) => {
+            info!("Install...");
+            let program = install_matches.get_one::<String>("program").unwrap();
+            let run_path = install_matches.get_one::<String>("run-path").unwrap();
+            let host_ip = install_matches.get_one::<String>("host-ip").unwrap();
+            install(&program, &run_path, &host_ip,
+                    &install_matches.get_one::<String>("log-level").unwrap())?;
+        }
+        Some(("uninstall", _)) => {
+            info!("Uninstall...");
+            uninstall()?;
+        }
+        Some(_) => {
+            info!("Run service");
+            service::run()?;
+        }
+        None => {
+            error!("No args passed");
         }
     }
 
-    Command::new(RUN_PATH).spawn().expect("Failed to start Kodi");
+    Ok(())
+}
+
+fn install(prg: &String, run_path: &String, host_ip: &String, log_level: &String) -> windows_service::Result<()> {
+    let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
+    let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
+
+    let service_binary_path = env::current_exe()
+        .unwrap()
+        .with_file_name("WolStart.exe");
+
+    let service_info = ServiceInfo {
+        name: OsString::from("wol_service"),
+        display_name: OsString::from("WakeOnLan service"),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        executable_path: service_binary_path,
+        error_control: ServiceErrorControl::Normal,
+        launch_arguments: vec![
+            OsString::from(prg),
+            OsString::from(run_path),
+            OsString::from(host_ip),
+            OsString::from(log_level),
+        ],
+        dependencies: vec![],
+        account_name: None,
+        account_password: None,
+    };
+    let service = service_manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG)?;
+    service.set_description("Windows service to run program on receiving wake on lan packet")?;
+    Ok(())
+}
+
+fn uninstall() -> windows_service::Result<()> {
+    let manager_access = ServiceManagerAccess::CONNECT;
+    let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
+
+    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+    let service = service_manager.open_service("wol_service", service_access)?;
+
+    // The service will be marked for deletion as long as this function call succeeds.
+    // However, it will not be deleted from the database until it is stopped and all open handles to it are closed.
+    service.delete()?;
+    // Our handle to it is not closed yet. So we can still query it.
+    if service.query_status()?.current_state != ServiceState::Stopped {
+        // If the service cannot be stopped, it will be deleted when the system restarts.
+        service.stop()?;
+    }
+    // Explicitly close our open handle to the service. This is automatically called when `service` goes out of scope.
+    drop(service);
+
+    // Win32 API does not give us a way to wait for service deletion.
+    // To check if the service is deleted from the database, we have to poll it ourselves.
+    let start = Instant::now();
+    let timeout = Duration::from_secs(15);
+    while start.elapsed() < timeout {
+        if let Err(windows_service::Error::Winapi(e)) =
+            service_manager.open_service("wol_service", ServiceAccess::QUERY_STATUS)
+        {
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) {
+                println!("wol_service is deleted.");
+                return Ok(());
+            }
+        }
+        sleep(Duration::from_secs(1));
+    }
+    println!("wol_service is marked for deletion.");
+
+    Ok(())
 }
